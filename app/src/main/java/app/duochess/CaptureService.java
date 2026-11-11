@@ -41,6 +41,7 @@ import java.util.Locale;
 
 import app.duochess.core.Advice;
 import app.duochess.core.Analyzer;
+import app.duochess.core.BoardGeom;
 import app.duochess.core.Engine;
 import app.duochess.core.Move;
 import app.duochess.core.Pgn;
@@ -72,6 +73,16 @@ public class CaptureService extends Service implements Tracker.Listener, Overlay
     private long lastRefresh;
     private boolean lastLive;
     private volatile boolean snapshotRequested;
+    private BoardOverlay board;
+    /** Virtual display size, real display size and size of the captured content. */
+    private int vw, vh, dw, dh;
+    private volatile int cw, ch;
+    private volatile boolean contentVisible = true;
+    /** True once we know whether our own overlays end up in the capture. */
+    private volatile boolean overlayChecked;
+    private volatile boolean overlaysCaptured;
+    private long lastOverlayCheck;
+    private long startedAt;
 
     @Override
     public IBinder onBind(Intent intent) {
@@ -111,6 +122,20 @@ public class CaptureService extends Service implements Tracker.Listener, Overlay
             public void onStop() {
                 main.post(CaptureService.this::shutdown);
             }
+
+            @Override
+            public void onCapturedContentResize(int width, int height) {
+                if (width > 0 && height > 0) {
+                    cw = width;
+                    ch = height;
+                }
+            }
+
+            @Override
+            public void onCapturedContentVisibilityChanged(boolean isVisible) {
+                contentVisible = isVisible;
+                refresh();
+            }
         }, main);
 
         int w, h, dpi;
@@ -126,16 +151,24 @@ public class CaptureService extends Service implements Tracker.Listener, Overlay
             w = real.widthPixels;
             h = real.heightPixels;
         }
+        dw = w;
+        dh = h;
+        cw = w;
+        ch = h;
         // Half resolution is plenty for recognising the board and four times cheaper.
         w /= 2;
         h /= 2;
+        vw = w;
+        vh = h;
         dpi = Math.max(80, dm.densityDpi / 2);
 
         tracker = new Tracker(this);
         final String enginePath = getApplicationInfo().nativeLibraryDir + "/libstockfish.so";
-        analyzer = new Analyzer(() -> new Engine(enginePath, 2, 32), 1500, this::refresh);
+        analyzer = new Analyzer(() -> new Engine(enginePath, 2, 32), 1000, this::refresh);
         analyzer.start();
 
+        board = new BoardOverlay(this);
+        board.show();
         overlay = new OverlayPanel(this, this);
         overlay.setText("DuoChess", "", "Откройте разбор партии в Duolingo (начальная позиция)", OverlayPanel.NEUTRAL);
         overlay.show();
@@ -148,6 +181,7 @@ public class CaptureService extends Service implements Tracker.Listener, Overlay
         display = projection.createVirtualDisplay("duochess", w, h, dpi,
                 DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, reader.getSurface(), null, ch);
         running = true;
+        startedAt = SystemClock.uptimeMillis();
     }
 
     private void onImage(ImageReader r) {
@@ -167,6 +201,7 @@ public class CaptureService extends Service implements Tracker.Listener, Overlay
                 snapshotRequested = false;
                 saveSnapshot(f);
             }
+            checkOverlayCaptured(f, now);
             if (tracker != null) tracker.process(f, now);
             boolean live = tracker != null && tracker.liveGame(now);
             if (live != lastLive || now - lastRefresh > 1000) {
@@ -204,44 +239,138 @@ public class CaptureService extends Service implements Tracker.Listener, Overlay
         Tracker t = tracker;
         Analyzer a = analyzer;
         OverlayPanel o = overlay;
-        if (t == null || a == null || o == null) return;
+        BoardOverlay bo = board;
+        if (t == null || a == null || o == null || bo == null) return;
         if (!t.active()) {
+            bo.clear();
             o.setText(t.status().isEmpty() ? "Ищу доску…" : t.status(), "",
                     "Откройте разбор партии в Duolingo (начальная позиция)", OverlayPanel.NEUTRAL);
             return;
         }
         if (t.liveGame(SystemClock.uptimeMillis())) {
+            bo.clear();
             a.request(new ArrayList<>());
             o.setText("Идёт партия: подсказки выключены", "",
                     "Подсказки появятся в разборе партии после игры", OverlayPanel.NEUTRAL);
             return;
         }
-        Position cur;
-        Position prev = null;
-        Move last;
-        synchronized (t) {
-            cur = t.current();
-            last = t.lastMove();
-            if (t.ply() > 0) prev = t.position(t.ply() - 1);
-        }
-        if (cur == null) return;
+        Position cur, prev = null, after = null;
+        Move next = null, last = null;
+        BoardGeom g;
+        boolean wb;
         List<Position> want = new ArrayList<>();
-        want.add(cur);
-        if (prev != null) want.add(prev);
+        synchronized (t) {
+            int ply = t.ply();
+            int n = t.lineLength();
+            cur = t.current();
+            if (cur == null) return;
+            if (ply > 0) {
+                prev = t.position(ply - 1);
+                last = t.move(ply - 1);
+            }
+            if (ply < n) {
+                next = t.move(ply);
+                after = t.position(ply + 1);
+            }
+            g = t.geom();
+            wb = t.playerWhite();
+            // Current position first, then its neighbours, then the rest of the known game.
+            want.add(cur);
+            if (after != null) want.add(after);
+            if (prev != null) want.add(prev);
+            for (int k = 1; k <= n; k++) {
+                if (ply + 1 + k <= n) want.add(t.position(ply + 1 + k));
+                if (ply - 1 - k >= 0) want.add(t.position(ply - 1 - k));
+            }
+        }
         a.request(want);
         a.start();
-        String[] lines = Advice.describe(prev, last, cur, a.get(prev), a.get(cur));
+        Advice.View v = Advice.describe(cur, a.get(cur), next, a.get(after), prev, last, a.get(prev));
         String err = a.error();
-        if (err != null) lines[2] = err;
-        o.setText(lines[0], lines[1], lines[2], colorFor(lines[0]));
+        if (err != null) v.l3 = err;
+        o.setText(v.l1, v.l2, v.l3, colorOf(v.verdict));
+
+        if (!overlayChecked || overlaysCaptured || !contentVisible || !t.boardVisible() || g == null) {
+            bo.clear();
+            return;
+        }
+        List<BoardOverlay.Arrow> arrows = new ArrayList<>();
+        if (v.played != null) arrows.add(new BoardOverlay.Arrow(v.played.from, v.played.to, arrowColor(v.verdict)));
+        if (v.best != null) arrows.add(new BoardOverlay.Arrow(v.best.from, v.best.to, BoardOverlay.GREEN));
+        float[] tl = toScreen(g.x0, g.y0);
+        bo.update(tl[0], tl[1], g.sq / scale(), wb, arrows);
     }
 
-    private static int colorFor(String line) {
-        if (line.endsWith("зевок")) return OverlayPanel.BLUNDER;
-        if (line.endsWith("ошибка")) return OverlayPanel.MISTAKE;
-        if (line.endsWith("неточность")) return OverlayPanel.INACCURACY;
-        if (line.endsWith("лучший ход") || line.endsWith("хороший ход")) return OverlayPanel.GOOD;
-        return OverlayPanel.NEUTRAL;
+    private static int colorOf(int verdict) {
+        switch (verdict) {
+            case Advice.GOOD: return OverlayPanel.GOOD;
+            case Advice.INACCURACY: return OverlayPanel.INACCURACY;
+            case Advice.MISTAKE: return OverlayPanel.MISTAKE;
+            case Advice.BLUNDER: return OverlayPanel.BLUNDER;
+            default: return OverlayPanel.NEUTRAL;
+        }
+    }
+
+    private static int arrowColor(int verdict) {
+        switch (verdict) {
+            case Advice.INACCURACY: return android.graphics.Color.argb(215, 255, 213, 79);
+            case Advice.MISTAKE: return android.graphics.Color.argb(215, 255, 152, 0);
+            case Advice.BLUNDER: return android.graphics.Color.argb(215, 255, 82, 82);
+            default: return android.graphics.Color.argb(190, 190, 205, 215);
+        }
+    }
+
+    // ------------------------------------------------------------------ capture <-> screen
+
+    /** Capture pixels per screen pixel. */
+    private float scale() {
+        return Math.min(vw / (float) cw, vh / (float) ch);
+    }
+
+    private float windowTop() {
+        if (ch >= dh - 2) return 0;
+        int id = getResources().getIdentifier("status_bar_height", "dimen", "android");
+        return id > 0 ? getResources().getDimensionPixelSize(id) : 0;
+    }
+
+    private float[] toScreen(float cx, float cy) {
+        float s = scale();
+        float ox = (vw - cw * s) / 2f, oy = (vh - ch * s) / 2f;
+        return new float[] {(cx - ox) / s, (cy - oy) / s + windowTop()};
+    }
+
+    private int[] toCapture(float sx, float sy) {
+        float s = scale();
+        float ox = (vw - cw * s) / 2f, oy = (vh - ch * s) / 2f;
+        return new int[] {Math.round(sx * s + ox), Math.round((sy - windowTop()) * s + oy)};
+    }
+
+    /**
+     * If the user chose to record the whole screen, our own arrows would be recorded too and
+     * confuse the board recognition. We check for the panel's coloured strip in the capture.
+     */
+    private void checkOverlayCaptured(ImageFrame f, long now) {
+        if (overlaysCaptured || overlay == null || now - lastOverlayCheck < 1500 || now - startedAt < 1500) return;
+        lastOverlayCheck = now;
+        int mx = overlay.markerX, my = overlay.markerY;
+        if (mx < 0) return;
+        int[] c = toCapture(mx, my);
+        int hits = 0;
+        for (int dx = -2; dx <= 2; dx += 2) {
+            int x = Math.max(0, Math.min(f.width() - 1, c[0] + dx));
+            int y = Math.max(0, Math.min(f.height() - 1, c[1]));
+            if (app.duochess.core.Vision.diff(f.rgb(x, y), OverlayPanel.MARKER & 0xFFFFFF) < 90) hits++;
+        }
+        if (hits >= 2) {
+            overlaysCaptured = true;
+            if (board != null) board.clear();
+            overlay.setHint("Стрелки и буквы на доске работают, только если при запуске выбрать «Одно приложение» → "
+                    + "Duolingo. Нажмите ✕ и запустите заново.");
+        }
+        if (!overlayChecked) {
+            overlayChecked = true;
+            refresh();
+        }
     }
 
     // ------------------------------------------------------------------ overlay buttons
@@ -359,6 +488,7 @@ public class CaptureService extends Service implements Tracker.Listener, Overlay
         running = false;
         if (analyzer != null) analyzer.stop();
         if (overlay != null) overlay.hide();
+        if (board != null) board.hide();
         if (display != null) display.release();
         if (projection != null) {
             MediaProjection p = projection;
@@ -386,6 +516,7 @@ public class CaptureService extends Service implements Tracker.Listener, Overlay
             running = false;
             if (analyzer != null) analyzer.stop();
             if (overlay != null) overlay.hide();
+            if (board != null) board.hide();
             if (display != null) display.release();
             if (projection != null) projection.stop();
             if (captureThread != null) captureThread.quitSafely();

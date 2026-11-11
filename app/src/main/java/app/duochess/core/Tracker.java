@@ -58,6 +58,20 @@ public final class Tracker {
         return active ? positions.get(cur) : null;
     }
 
+    /** Number of moves known in the current line (may run past the shown position). */
+    public synchronized int lineLength() {
+        return active ? moves.size() : 0;
+    }
+
+    public synchronized Move move(int i) {
+        return moves.get(i);
+    }
+
+    /** True if the board was visible in the latest frame. */
+    public synchronized boolean boardVisible() {
+        return geom != null && invisible == 0;
+    }
+
     /** Move that led to the current position, or null at the start. */
     public synchronized Move lastMove() {
         return active && cur > 0 ? moves.get(cur - 1) : null;

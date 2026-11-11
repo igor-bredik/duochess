@@ -31,6 +31,8 @@ final class OverlayPanel {
     static final int INACCURACY = Color.rgb(255, 213, 79);
     static final int MISTAKE = Color.rgb(255, 152, 0);
     static final int BLUNDER = Color.rgb(255, 82, 82);
+    /** Colour of the thin strip on top of the panel; if it shows up in the capture, overlays are being recorded. */
+    static final int MARKER = Color.rgb(255, 0, 170);
 
     private final Context ctx;
     private final WindowManager wm;
@@ -40,7 +42,25 @@ final class OverlayPanel {
     private final TextView line1;
     private final TextView line2;
     private final TextView line3;
+    private final TextView hint;
+    private final View strip;
     private boolean shown;
+    /** Centre of the marker strip on screen, or -1 if not laid out yet. */
+    volatile int markerX = -1, markerY = -1;
+    private final int[] loc = new int[2];
+    private final Runnable locate = new Runnable() {
+        @Override
+        public void run() {
+            if (shown && strip.getWidth() > 0) {
+                strip.getLocationOnScreen(loc);
+                markerX = loc[0] + strip.getWidth() / 2;
+                markerY = loc[1] + strip.getHeight() / 2;
+            } else {
+                markerX = -1;
+            }
+            main.postDelayed(this, 1000);
+        }
+    };
 
     @SuppressLint("ClickableViewAccessibility")
     OverlayPanel(Context ctx, Actions actions) {
@@ -59,12 +79,25 @@ final class OverlayPanel {
         bg.setStroke(dp(1), Color.argb(255, 60, 74, 82));
         root.setBackground(bg);
 
-        line1 = text(16, true, NEUTRAL);
-        line2 = text(14, false, INACCURACY);
-        line3 = text(14, false, Color.rgb(176, 190, 197));
+        strip = new View(ctx);
+        GradientDrawable sbg = new GradientDrawable();
+        sbg.setColor(MARKER);
+        sbg.setCornerRadius(dp(2));
+        strip.setBackground(sbg);
+        LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(dp(48), dp(4));
+        slp.gravity = Gravity.CENTER_HORIZONTAL;
+        slp.bottomMargin = dp(6);
+        root.addView(strip, slp);
+
+        line1 = text(15, true, NEUTRAL);
+        line2 = text(13, false, Color.rgb(230, 236, 240));
+        line3 = text(13, false, Color.rgb(176, 190, 197));
+        hint = text(12, false, INACCURACY);
         root.addView(line1);
         root.addView(line2);
         root.addView(line3);
+        root.addView(hint);
+        hint.setVisibility(View.GONE);
 
         LinearLayout buttons = new LinearLayout(ctx);
         buttons.setOrientation(LinearLayout.HORIZONTAL);
@@ -83,7 +116,7 @@ final class OverlayPanel {
                 PixelFormat.TRANSLUCENT);
         lp.gravity = Gravity.TOP | Gravity.START;
         lp.x = (int) (screenW * 0.03f);
-        lp.y = (int) (screenH * 0.2f);
+        lp.y = (int) (screenH * 0.155f);
 
         root.setOnTouchListener(new View.OnTouchListener() {
             private float downY;
@@ -142,16 +175,26 @@ final class OverlayPanel {
             if (!shown) {
                 wm.addView(root, lp);
                 shown = true;
+                main.removeCallbacks(locate);
+                main.postDelayed(locate, 500);
             }
         });
     }
 
     void hide() {
         main.post(() -> {
+            main.removeCallbacks(locate);
             if (shown) {
                 wm.removeView(root);
                 shown = false;
             }
+        });
+    }
+
+    void setHint(String h) {
+        main.post(() -> {
+            hint.setText(h);
+            hint.setVisibility(h == null || h.isEmpty() ? View.GONE : View.VISIBLE);
         });
     }
 
