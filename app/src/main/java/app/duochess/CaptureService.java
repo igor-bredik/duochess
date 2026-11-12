@@ -56,7 +56,7 @@ public class CaptureService extends Service implements Tracker.Listener, Overlay
     static final String EXTRA_DATA = "data";
     private static final String CHANNEL = "analysis";
     private static final int NOTIF_ID = 1;
-    private static final long FRAME_MS = 250;
+    private static final long FRAME_MS = 150;
     private static final String TAG = "DuoChess";
 
     static volatile boolean running;

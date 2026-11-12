@@ -154,7 +154,6 @@ public final class Tracker {
             stable++;
         } else {
             stable = 0;
-            live.boardChanged(now);
         }
         lastSig = sig;
         if (stable < 2) return false;
