@@ -6,8 +6,9 @@ import java.util.List;
 import java.util.Locale;
 
 /**
- * Follows a game shown on screen: finds the board in the starting position, then keeps track of
- * moves going forward and backward (as when stepping through Duolingo's game review).
+ * Follows a game shown on screen: finds the board in the starting position (or reads the position
+ * now on the board, when asked), then keeps track of moves going forward and backward (as when
+ * stepping through Duolingo's game review).
  */
 public final class Tracker {
     public interface Listener {
@@ -15,6 +16,15 @@ public final class Tracker {
         void onPosition(Tracker t);
 
         void onStatus(String status);
+
+        /**
+         * Piece looks learned from a starting position and the places the board was seen at,
+         * worth keeping for later sessions.
+         */
+        void onCalibrated(Calibration pieces, List<BoardGeom> boards);
+
+        /** A message for the user, e.g. why the position could not be read. */
+        void onNotice(String text);
     }
 
     private final Listener listener;
@@ -33,7 +43,14 @@ public final class Tracker {
     private int invisible;
     private int frameNo;
     private String status = "";
-    private final LiveWatch live = new LiveWatch();
+    /** Piece looks from the last starting position seen (this session or an earlier one). */
+    private Calibration saved;
+    /** Where boards were seen (most recent first): screens differ between the game and the review. */
+    private final List<BoardGeom> boards = new ArrayList<>();
+    /** False if the game was picked up from the middle (move numbers unknown). */
+    private boolean fromStart = true;
+    /** 0: nothing asked; 1 / 2: read the board with White / Black to move. */
+    private volatile int readRequest;
     public final StringBuilder log = new StringBuilder();
 
     public Tracker(Listener listener) {
@@ -87,8 +104,29 @@ public final class Tracker {
         return whiteBottom;
     }
 
-    public boolean liveGame(long now) {
-        return live.live(now);
+    /** True if the position can be read from the board (piece looks are known). */
+    public synchronized boolean canRead() {
+        return saved != null;
+    }
+
+    public synchronized void setSaved(Calibration c, List<BoardGeom> knownBoards) {
+        saved = c;
+        boards.clear();
+        if (knownBoards != null) boards.addAll(knownBoards);
+    }
+
+    /** True if the game was followed from the starting position. */
+    public synchronized boolean fromStart() {
+        return fromStart;
+    }
+
+    /** Asks to take the position now on the board as the start, with the given side to move. */
+    public void requestRead(boolean whiteToMove) {
+        readRequest = whiteToMove ? 1 : 2;
+    }
+
+    public boolean readPending() {
+        return readRequest != 0;
     }
 
     public String status() {
@@ -123,6 +161,11 @@ public final class Tracker {
 
     private boolean step(Frame f, long now) {
         frameNo++;
+        int rq = readRequest;
+        if (rq != 0) {
+            readRequest = 0;
+            return readBoard(f, rq == 1);
+        }
         if (geom == null) {
             if (frameNo % 2 != 0) return false;
             Vision.Detection d = Vision.detect(f, null);
@@ -147,7 +190,6 @@ public final class Tracker {
             return false;
         }
         invisible = 0;
-        live.update(f, geom, now);
         int[] sig = new int[64];
         for (int i = 0; i < 64; i++) sig[i] = img[i].state;
         if (lastSig != null && hamming(sig, lastSig) == 0) {
@@ -176,6 +218,7 @@ public final class Tracker {
         geom = d.geom;
         whiteBottom = d.whiteBottom;
         cal = Calibration.build(f, geom, whiteBottom, Position.initial(), d.odd);
+        remember();
         startGame();
         lastSig = null;
         stable = 0;
@@ -191,11 +234,80 @@ public final class Tracker {
         active = true;
         lastDeepSig = null;
         lastJump = -1;
-        live.reset();
+        fromStart = true;
+    }
+
+    private void remember() {
+        saved = cal.snapshot();
+        rememberBoard(geom);
+        listener.onCalibrated(saved, new ArrayList<>(boards));
+    }
+
+    /** Returns true if g is a new place. */
+    private boolean rememberBoard(BoardGeom g) {
+        boolean known = !boards.isEmpty() && boards.get(0).near(g);
+        for (int i = boards.size() - 1; i >= 0; i--) if (boards.get(i).near(g)) boards.remove(i);
+        boards.add(0, g);
+        while (boards.size() > 4) boards.remove(boards.size() - 1);
+        return !known;
     }
 
     private String statusText() {
-        return String.format(Locale.forLanguageTag("ru"), "Слежу за доской (%s снизу), ход %d", whiteBottom ? "белые" : "чёрные", (cur + 1) / 2);
+        String side = whiteBottom ? "белые" : "чёрные";
+        if (!fromStart) return "Слежу за доской (" + side + " снизу)";
+        return String.format(Locale.forLanguageTag("ru"), "Слежу за доской (%s снизу), ход %d", side, (cur + 1) / 2);
+    }
+
+    /** Takes the position now on the board as the start of the game. */
+    private boolean readBoard(Frame f, boolean whiteToMove) {
+        if (saved == null) {
+            listener.onNotice("Сначала откройте партию в начальной позиции: так я запомню, как выглядят фигуры");
+            return false;
+        }
+        BoardGeom g = Vision.findBoard(f);
+        if (g == null) {
+            // Pieces may hide the lines the search needs: try where boards were seen before.
+            List<BoardGeom> known = new ArrayList<>();
+            if (geom != null) known.add(geom);
+            known.addAll(boards);
+            for (BoardGeom k : known) {
+                if (Vision.looksLikeBoard(f, k)) {
+                    g = k;
+                    break;
+                }
+            }
+        }
+        if (g == null) {
+            logLine("read: no board");
+            listener.onNotice("Не вижу доску на экране");
+            return false;
+        }
+        Calibration c = saved.forFrame(f, g);
+        BoardReader.Result r = BoardReader.read(f, g, c, whiteToMove, geom != null ? whiteBottom : true);
+        if (r.pos == null) {
+            logLine("read failed at " + g + ": " + r.error);
+            listener.onNotice(r.error);
+            return false;
+        }
+        geom = g;
+        cal = c;
+        whiteBottom = r.whiteBottom;
+        positions.clear();
+        moves.clear();
+        positions.add(r.pos);
+        cur = 0;
+        active = true;
+        fromStart = false;
+        lastDeepSig = null;
+        lastJump = -1;
+        lastSig = null;
+        stable = 0;
+        invisible = 0;
+        logLine("read position at " + g + ": " + r.pos.toFen() + (whiteBottom ? ", white" : ", black") + " at bottom");
+        if (rememberBoard(g)) listener.onCalibrated(saved, new ArrayList<>(boards));
+        if (r.note != null) listener.onNotice(r.note);
+        setStatus(statusText());
+        return true;
     }
 
     private boolean evaluate(Calibration.Obs[] img, Frame f, int[] sig, long now) {
@@ -305,7 +417,7 @@ public final class Tracker {
                 return true;
             }
         }
-        setStatus("Не узнаю позицию. Вернитесь к началу партии");
+        setStatus("Не узнаю позицию. Вернитесь к началу партии или нажмите «Позиция»");
         return false;
     }
 
@@ -325,6 +437,7 @@ public final class Tracker {
     private void newGame(Frame f, boolean wb, boolean[] skip) {
         whiteBottom = wb;
         cal = Calibration.build(f, geom, wb, Position.initial(), skip);
+        remember();
         startGame();
         logLine("new game, " + (wb ? "white" : "black") + " at bottom");
         setStatus(statusText());

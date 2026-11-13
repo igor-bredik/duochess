@@ -24,7 +24,8 @@ public final class Advice {
         return sb.append(rest).toString();
     }
 
-    public static String moveLabel(Position before, Move m) {
+    public static String moveLabel(Position before, Move m, boolean numbered) {
+        if (!numbered) return ru(before.san(m));
         String num = before.fullmove + (before.whiteToMove ? ". " : "… ");
         return num + ru(before.san(m));
     }
@@ -82,7 +83,8 @@ public final class Advice {
         }
     }
 
-    private static String header(Position p) {
+    private static String header(Position p, boolean numbered) {
+        if (!numbered) return p.whiteToMove ? "Ход белых" : "Ход чёрных";
         if (p.fullmove == 1 && p.whiteToMove) return "Начало, ход белых";
         return p.fullmove + (p.whiteToMove ? ". Ход белых" : "… Ход чёрных");
     }
@@ -93,9 +95,11 @@ public final class Advice {
      * @param next  move played next in the game, if already known
      * @param eNext evaluation of the position after next
      * @param prev  previous position and last the move that led to cur (for when next is unknown)
+     * @param numbered false if the game was picked up from the middle (move numbers unknown)
+     * @param arrows   true if the arrows are shown on the board
      */
     public static View describe(Position cur, Engine.Eval eCur, Move next, Engine.Eval eNext,
-                                Position prev, Move last, Engine.Eval ePrev) {
+                                Position prev, Move last, Engine.Eval ePrev, boolean numbered, boolean arrows) {
         View v = new View();
         if (cur.isCheckmate()) {
             v.l1 = "Мат. " + (cur.whiteToMove ? "Чёрные" : "Белые") + " победили";
@@ -105,7 +109,8 @@ public final class Advice {
             v.l1 = "Пат, ничья";
             return v;
         }
-        String head = header(cur);
+        String head = header(cur, numbered);
+        String green = arrows ? " (зелёная стрелка)" : "";
         if (eCur == null) {
             v.l1 = head;
             v.l3 = "Считаю…";
@@ -118,17 +123,17 @@ public final class Advice {
             String playedTxt = ru(cur.san(next));
             if (eNext == null) {
                 v.l1 = head + ". В партии " + playedTxt + " — считаю…";
-                v.l2 = "Лучший ход " + bestTxt + " (зелёная стрелка)";
+                v.l2 = "Лучший ход " + bestTxt + green;
             } else {
                 String j = judgement(cur, next, eCur, eNext);
                 v.verdict = verdictOf(j);
                 v.l1 = head + ". В партии " + playedTxt + " — " + j;
                 if (best != null && best.equals(next)) {
-                    v.l2 = "Это и есть лучший ход (зелёная стрелка)";
+                    v.l2 = "Это и есть лучший ход" + green;
                 } else {
                     v.played = next;
-                    v.l2 = isBad(j) ? "Лучше " + bestTxt + " (зелёная стрелка)"
-                            : "Тоже нормально. Лучший " + bestTxt + " (зелёная стрелка)";
+                    v.l2 = isBad(j) ? "Лучше " + bestTxt + green
+                            : "Тоже нормально. Лучший " + bestTxt + green;
                 }
             }
             v.l3 = "Оценка сейчас " + evalText(eCur);
@@ -138,11 +143,19 @@ public final class Advice {
         v.l3 = "Оценка " + evalText(eCur);
         if (prev != null && last != null && !last.isNull() && ePrev != null) {
             String j = judgement(prev, last, ePrev, eCur);
-            v.l2 = "Прошлый ход " + moveLabel(prev, last) + " — " + j;
-        } else if (prev == null) {
+            v.l2 = "Прошлый ход " + moveLabel(prev, last, numbered) + " — " + j;
+        } else if (prev == null && numbered) {
             v.l2 = "Совет: пролистайте партию до конца и вернитесь в начало, тогда оценка каждого хода будет видна до него";
         }
         return v;
+    }
+
+    /** Evaluation for the collapsed panel: +0.8, −1.5, #3 (White mates), −#3. */
+    public static String tinyEval(Engine.Eval e) {
+        if (e.mate != 0) return (e.mate > 0 ? "#" : "−#") + Math.abs(e.mate);
+        double v = e.cp / 100.0;
+        if (Math.abs(v) < 0.05) return "0.0";
+        return String.format(Locale.US, "%+.1f", v).replace('-', '−');
     }
 
     public static String shortEval(Engine.Eval e) {
