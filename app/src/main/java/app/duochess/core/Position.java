@@ -68,6 +68,19 @@ public final class Position {
         return p;
     }
 
+    /** Castling rights for a position seen on screen: kings and rooks still on their home squares. */
+    public void inferCastling() {
+        castling = 0;
+        if (b[4] == K) {
+            if (b[7] == R) castling |= WK;
+            if (b[0] == R) castling |= WQ;
+        }
+        if (b[60] == -K) {
+            if (b[63] == -R) castling |= BK;
+            if (b[56] == -R) castling |= BQ;
+        }
+    }
+
     public String toFen() {
         StringBuilder sb = new StringBuilder();
         for (int r = 7; r >= 0; r--) {

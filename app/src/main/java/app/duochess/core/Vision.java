@@ -119,20 +119,27 @@ public final class Vision {
     }
 
     private static RowHit scanRow(Frame f, int y, int[] st, int[] ln, int[] co) {
+        return scanLine(f, false, y, st, ln, co);
+    }
+
+    /** Looks for 8 alternating squares along one row of the frame (or one column, if vertical). */
+    private static RowHit scanLine(Frame f, boolean vertical, int pos, int[] st, int[] ln, int[] co) {
         int w = f.width();
+        int len = vertical ? f.height() : w;
         int n = 0;
         int x = 0;
         int minLen = Math.max(4, w / 40);
-        while (x < w) {
-            int c0 = f.rgb(x, y);
+        while (x < len) {
+            int c0 = vertical ? f.rgb(pos, x) : f.rgb(x, pos);
             int s = x;
             x++;
-            while (x < w && diff(f.rgb(x, y), c0) <= SEG_TOL) x++;
-            int len = x - s;
-            if (len >= minLen) {
+            while (x < len && diff(vertical ? f.rgb(pos, x) : f.rgb(x, pos), c0) <= SEG_TOL) x++;
+            int l = x - s;
+            if (l >= minLen) {
                 st[n] = s;
-                ln[n] = len;
-                co[n] = f.rgb(s + len / 2, y);
+                ln[n] = l;
+                int m = s + l / 2;
+                co[n] = vertical ? f.rgb(pos, m) : f.rgb(m, pos);
                 n++;
             }
         }
@@ -153,7 +160,7 @@ public final class Vision {
             for (int j = i; j < i + 7 && ok; j++) if (diff(co[j], co[j + 1]) < ALT_DIFF) ok = false;
             if (!ok) continue;
             RowHit h = new RowHit();
-            h.y = y;
+            h.y = pos;
             h.len = L;
             h.x0 = st[i + 1] - L;
             h.lightFirst = gray(co[i]) > gray(co[i + 1]);
@@ -223,6 +230,81 @@ public final class Vision {
             if (d != null) return d;
         }
         return null;
+    }
+
+    /**
+     * Finds the board in any position (not only the starting one). Rows of the frame give the
+     * left edge and square size, columns the top edge: lines that pass beside the pieces cross
+     * 8 alternating squares. Returns null if there is no board.
+     */
+    public static BoardGeom findBoard(Frame f) {
+        int n = Math.max(f.width(), f.height());
+        int[] st = new int[n], ln = new int[n], co = new int[n];
+        float[] xs = fitAxis(f, false, st, ln, co);
+        if (xs == null) return null;
+        float[] ys = fitAxis(f, true, st, ln, co);
+        if (ys == null) return null;
+        if (Math.abs(xs[1] - ys[1]) > 0.04f * xs[1]) return null;
+        BoardGeom g = new BoardGeom(xs[0], ys[0], (xs[1] + ys[1]) / 2f);
+        return looksLikeBoard(f, g) ? g : null;
+    }
+
+    /** Board edge and square size along one axis: {edge, square size}, or null. */
+    private static float[] fitAxis(Frame f, boolean vertical, int[] st, int[] ln, int[] co) {
+        int lines = vertical ? f.width() : f.height();
+        int step = Math.max(1, lines / 600);
+        List<RowHit> hits = new ArrayList<>();
+        for (int p = 0; p < lines; p += step) {
+            RowHit hit = scanLine(f, vertical, p, st, ln, co);
+            if (hit != null) hits.add(hit);
+        }
+        if (hits.size() < 6) return null;
+        List<Float> xs = new ArrayList<>(), ls = new ArrayList<>();
+        for (RowHit r : hits) {
+            xs.add(r.x0);
+            ls.add(r.len);
+        }
+        float mx = median(xs), ml = median(ls);
+        List<Float> kept = new ArrayList<>();
+        float sumL = 0;
+        for (RowHit r : hits) {
+            if (Math.abs(r.x0 - mx) <= Math.max(3f, ml * 0.05f) && Math.abs(r.len - ml) <= ml * 0.03f) {
+                kept.add(r.x0);
+                sumL += r.len;
+            }
+        }
+        if (kept.size() < 6) return null;
+        return new float[] {median(kept), sumL / kept.size()};
+    }
+
+    /** True if the 64 squares at g have two background colours in a checkerboard pattern. */
+    public static boolean looksLikeBoard(Frame f, BoardGeom g) {
+        float m = 0.1f * g.sq;
+        if (g.x0 < -m || g.y0 < -m || g.x0 + 8 * g.sq > f.width() + m || g.y0 + 8 * g.sq > f.height() + m) return false;
+        int[] ring = new int[64];
+        long[][] acc = new long[2][3];
+        int[] cnt = new int[2];
+        for (int r = 0; r < 8; r++) {
+            for (int c = 0; c < 8; c++) {
+                int v = ringColor(f, g, r, c);
+                int par = (r + c) & 1;
+                ring[r * 8 + c] = v;
+                acc[par][0] += (v >> 16) & 255;
+                acc[par][1] += (v >> 8) & 255;
+                acc[par][2] += v & 255;
+                cnt[par]++;
+            }
+        }
+        int[] mean = new int[2];
+        for (int p = 0; p < 2; p++) {
+            mean[p] = (int) ((acc[p][0] / cnt[p]) << 16 | (acc[p][1] / cnt[p]) << 8 | (acc[p][2] / cnt[p]));
+        }
+        if (diff(mean[0], mean[1]) < ALT_DIFF) return false;
+        int ok = 0;
+        for (int i = 0; i < 64; i++) {
+            if (diff(ring[i], mean[((i >> 3) + (i & 7)) & 1]) <= 45) ok++;
+        }
+        return ok >= 48;
     }
 
     /** Checks that the board at g shows the starting position (allowing one move). */

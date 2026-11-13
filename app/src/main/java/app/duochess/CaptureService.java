@@ -8,6 +8,7 @@ import android.app.Service;
 import android.content.ContentValues;
 import android.content.Context;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.content.pm.ServiceInfo;
 import android.graphics.Bitmap;
 import android.graphics.PixelFormat;
@@ -31,6 +32,13 @@ import android.util.Log;
 import android.view.WindowManager;
 import android.widget.Toast;
 
+import java.io.BufferedInputStream;
+import java.io.BufferedOutputStream;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.text.SimpleDateFormat;
@@ -42,6 +50,7 @@ import java.util.Locale;
 import app.duochess.core.Advice;
 import app.duochess.core.Analyzer;
 import app.duochess.core.BoardGeom;
+import app.duochess.core.Calibration;
 import app.duochess.core.Engine;
 import app.duochess.core.Move;
 import app.duochess.core.Pgn;
@@ -58,6 +67,9 @@ public class CaptureService extends Service implements Tracker.Listener, Overlay
     private static final int NOTIF_ID = 1;
     private static final long FRAME_MS = 150;
     private static final String TAG = "DuoChess";
+    private static final String PREFS = "duochess";
+    /** Piece looks from the last starting position seen, to start from any position later. */
+    private static final String PIECES_FILE = "pieces.bin";
 
     static volatile boolean running;
 
@@ -66,13 +78,18 @@ public class CaptureService extends Service implements Tracker.Listener, Overlay
     private VirtualDisplay display;
     private ImageReader reader;
     private HandlerThread captureThread;
+    private volatile Handler captureHandler;
+    private final ImageFrame frame = new ImageFrame();
+    /** Newest image not processed yet (capture thread only). */
+    private Image held;
+    private final Runnable processHeldTask = this::processHeld;
     private OverlayPanel overlay;
     private Tracker tracker;
     private Analyzer analyzer;
     private long lastFrame;
     private long lastRefresh;
-    private boolean lastLive;
     private volatile boolean snapshotRequested;
+    private volatile boolean arrowsOn = true;
     private BoardOverlay board;
     /** Virtual display size, real display size and size of the captured content. */
     private int vw, vh, dw, dh;
@@ -162,7 +179,10 @@ public class CaptureService extends Service implements Tracker.Listener, Overlay
         vh = h;
         dpi = Math.max(80, dm.densityDpi / 2);
 
+        SharedPreferences prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
+        arrowsOn = prefs.getBoolean("arrows", true);
         tracker = new Tracker(this);
+        loadPieces(tracker);
         final String enginePath = getApplicationInfo().nativeLibraryDir + "/libstockfish.so";
         analyzer = new Analyzer(() -> new Engine(enginePath, 2, 32), 1000, this::refresh);
         analyzer.start();
@@ -170,13 +190,16 @@ public class CaptureService extends Service implements Tracker.Listener, Overlay
         board = new BoardOverlay(this);
         board.show();
         overlay = new OverlayPanel(this, this);
-        overlay.setText("DuoChess", "", "Откройте разбор партии в Duolingo (начальная позиция)", OverlayPanel.NEUTRAL);
+        overlay.setText("DuoChess", "", "Ищу доску…", OverlayPanel.NEUTRAL);
+        overlay.setArrows(arrowsOn);
         overlay.show();
 
         captureThread = new HandlerThread("capture");
         captureThread.start();
         Handler ch = new Handler(captureThread.getLooper());
-        reader = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 2);
+        captureHandler = ch;
+        // One image may be held back while the next one is acquired.
+        reader = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 3);
         reader.setOnImageAvailableListener(this::onImage, ch);
         display = projection.createVirtualDisplay("duochess", w, h, dpi,
                 DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, reader.getSurface(), null, ch);
@@ -184,6 +207,10 @@ public class CaptureService extends Service implements Tracker.Listener, Overlay
         startedAt = SystemClock.uptimeMillis();
     }
 
+    /**
+     * At most one frame per FRAME_MS is processed. The newest image is kept until then, so the
+     * last frame before the screen goes still (e.g. the end of a move animation) is not lost.
+     */
     private void onImage(ImageReader r) {
         Image img;
         try {
@@ -192,24 +219,27 @@ public class CaptureService extends Service implements Tracker.Listener, Overlay
             return;
         }
         if (img == null) return;
+        closeHeld();
+        held = img;
+        Handler h = captureHandler;
+        long wait = lastFrame + FRAME_MS - SystemClock.uptimeMillis();
+        if (wait <= 0 || h == null) {
+            processHeld();
+        } else {
+            h.removeCallbacks(processHeldTask);
+            h.postDelayed(processHeldTask, wait);
+        }
+    }
+
+    private void processHeld() {
+        Image img = held;
+        held = null;
+        if (img == null) return;
         try {
-            long now = SystemClock.uptimeMillis();
-            if (now - lastFrame < FRAME_MS) return;
-            lastFrame = now;
-            ImageFrame f = new ImageFrame(img);
-            if (snapshotRequested) {
-                snapshotRequested = false;
-                saveSnapshot(f);
-            }
-            checkOverlayCaptured(f, now);
-            if (tracker != null) tracker.process(f, now);
-            boolean live = tracker != null && tracker.liveGame(now);
-            if (live != lastLive || now - lastRefresh > 1000) {
-                lastLive = live;
-                refresh();
-            }
+            frame.copyFrom(img);
         } catch (Throwable t) {
-            Log.e(TAG, "frame failed", t);
+            Log.e(TAG, "frame copy failed", t);
+            return;
         } finally {
             try {
                 img.close();
@@ -217,6 +247,53 @@ public class CaptureService extends Service implements Tracker.Listener, Overlay
                 // reader already closed
             }
         }
+        long now = SystemClock.uptimeMillis();
+        lastFrame = now;
+        handleFrame(now);
+    }
+
+    private void closeHeld() {
+        if (held != null) {
+            try {
+                held.close();
+            } catch (Exception ignored) {
+                // reader already closed
+            }
+            held = null;
+        }
+    }
+
+    /** Capture thread. */
+    private void handleFrame(long now) {
+        try {
+            if (snapshotRequested) {
+                snapshotRequested = false;
+                saveSnapshot(frame);
+            }
+            checkOverlayCaptured(frame, now);
+            if (tracker != null) tracker.process(frame, now);
+            if (now - lastRefresh > 1000) refresh();
+        } catch (Throwable t) {
+            Log.e(TAG, "frame failed", t);
+        }
+    }
+
+    /**
+     * New frames arrive only when the screen changes. If a button asked for work on the frame,
+     * use the last one when nothing new comes in.
+     */
+    private void kick() {
+        Handler h = captureHandler;
+        if (h == null) return;
+        h.postDelayed(() -> {
+            long now = SystemClock.uptimeMillis();
+            Tracker t = tracker;
+            boolean pending = snapshotRequested || (t != null && t.readPending());
+            if (pending && frame.valid() && now - lastFrame >= FRAME_MS) {
+                lastFrame = now;
+                handleFrame(now);
+            }
+        }, 300);
     }
 
     // ------------------------------------------------------------------ Tracker.Listener
@@ -232,6 +309,44 @@ public class CaptureService extends Service implements Tracker.Listener, Overlay
         refresh();
     }
 
+    @Override
+    public void onCalibrated(Calibration pieces, List<BoardGeom> boards) {
+        File dir = getFilesDir();
+        File tmp = new File(dir, PIECES_FILE + ".tmp");
+        try (DataOutputStream out = new DataOutputStream(new BufferedOutputStream(new FileOutputStream(tmp)))) {
+            pieces.write(out);
+            out.writeInt(boards.size());
+            for (BoardGeom g : boards) {
+                out.writeFloat(g.x0);
+                out.writeFloat(g.y0);
+                out.writeFloat(g.sq);
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "could not save pieces", e);
+            return;
+        }
+        if (!tmp.renameTo(new File(dir, PIECES_FILE))) Log.w(TAG, "could not save pieces");
+    }
+
+    @Override
+    public void onNotice(String text) {
+        toast(text);
+    }
+
+    private void loadPieces(Tracker t) {
+        File f = new File(getFilesDir(), PIECES_FILE);
+        if (!f.exists()) return;
+        try (DataInputStream in = new DataInputStream(new BufferedInputStream(new FileInputStream(f)))) {
+            Calibration pieces = Calibration.read(in);
+            List<BoardGeom> boards = new ArrayList<>();
+            int n = in.readInt();
+            for (int i = 0; i < n && i < 8; i++) boards.add(new BoardGeom(in.readFloat(), in.readFloat(), in.readFloat()));
+            t.setSaved(pieces, boards);
+        } catch (Exception e) {
+            Log.w(TAG, "could not read saved pieces", e);
+        }
+    }
+
     // ------------------------------------------------------------------ overlay text
 
     private synchronized void refresh() {
@@ -243,21 +358,22 @@ public class CaptureService extends Service implements Tracker.Listener, Overlay
         if (t == null || a == null || o == null || bo == null) return;
         if (!t.active()) {
             bo.clear();
+            boolean canRead = t.canRead();
+            o.setChooserAuto(canRead);
             o.setText(t.status().isEmpty() ? "Ищу доску…" : t.status(), "",
-                    "Откройте разбор партии в Duolingo (начальная позиция)", OverlayPanel.NEUTRAL);
+                    canRead ? "Откройте партию в начальной позиции или начните с той, что сейчас на доске:"
+                            : "Откройте партию в начальной позиции. Это нужно один раз, чтобы запомнить фигуры: "
+                            + "потом можно будет начинать с любой позиции",
+                    OverlayPanel.NEUTRAL);
+            o.setShort("♞", OverlayPanel.NEUTRAL);
             return;
         }
-        if (t.liveGame(SystemClock.uptimeMillis())) {
-            bo.clear();
-            a.request(new ArrayList<>());
-            o.setText("Идёт партия: подсказки выключены", "",
-                    "Подсказки появятся в разборе партии после игры", OverlayPanel.NEUTRAL);
-            return;
-        }
+        o.setChooserAuto(false);
         Position cur, prev = null, after = null;
         Move next = null, last = null;
         BoardGeom g;
-        boolean wb;
+        boolean wb, numbered;
+        boolean arrows = arrowsOn;
         List<Position> want = new ArrayList<>();
         synchronized (t) {
             int ply = t.ply();
@@ -274,6 +390,7 @@ public class CaptureService extends Service implements Tracker.Listener, Overlay
             }
             g = t.geom();
             wb = t.playerWhite();
+            numbered = t.fromStart();
             // Current position first, then its neighbours, then the rest of the known game.
             want.add(cur);
             if (after != null) want.add(after);
@@ -285,20 +402,24 @@ public class CaptureService extends Service implements Tracker.Listener, Overlay
         }
         a.request(want);
         a.start();
-        Advice.View v = Advice.describe(cur, a.get(cur), next, a.get(after), prev, last, a.get(prev));
+        Engine.Eval eCur = a.get(cur);
+        Advice.View v = Advice.describe(cur, eCur, next, a.get(after), prev, last, a.get(prev), numbered, arrows);
         String err = a.error();
         if (err != null) v.l3 = err;
         o.setText(v.l1, v.l2, v.l3, colorOf(v.verdict));
+        o.setShort("♞ " + (eCur != null ? Advice.tinyEval(eCur) : "…"), colorOf(v.verdict));
 
         if (!overlayChecked || overlaysCaptured || !contentVisible || !t.boardVisible() || g == null) {
             bo.clear();
             return;
         }
-        List<BoardOverlay.Arrow> arrows = new ArrayList<>();
-        if (v.played != null) arrows.add(new BoardOverlay.Arrow(v.played.from, v.played.to, arrowColor(v.verdict)));
-        if (v.best != null) arrows.add(new BoardOverlay.Arrow(v.best.from, v.best.to, BoardOverlay.GREEN));
+        List<BoardOverlay.Arrow> list = new ArrayList<>();
+        if (arrows) {
+            if (v.played != null) list.add(new BoardOverlay.Arrow(v.played.from, v.played.to, arrowColor(v.verdict)));
+            if (v.best != null) list.add(new BoardOverlay.Arrow(v.best.from, v.best.to, BoardOverlay.GREEN));
+        }
         float[] tl = toScreen(g.x0, g.y0);
-        bo.update(tl[0], tl[1], g.sq / scale(), wb, arrows);
+        bo.update(tl[0], tl[1], g.sq / scale(), wb, list);
     }
 
     private static int colorOf(int verdict) {
@@ -385,7 +506,7 @@ public class CaptureService extends Service implements Tracker.Listener, Overlay
         String url;
         synchronized (t) {
             List<String> san = t.sanLine();
-            if (san.contains("--")) {
+            if (!t.fromStart() || san.contains("--")) {
                 url = "https://lichess.org/analysis/standard/" + t.current().toFen().replace(' ', '_');
             } else {
                 url = Pgn.lichessUrl(san, t.playerWhite()) + "#" + t.ply();
@@ -403,6 +524,35 @@ public class CaptureService extends Service implements Tracker.Listener, Overlay
     @Override
     public void onSnapshot() {
         snapshotRequested = true;
+        kick();
+    }
+
+    @Override
+    public void onArrows() {
+        arrowsOn = !arrowsOn;
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean("arrows", arrowsOn).apply();
+        if (overlay != null) overlay.setArrows(arrowsOn);
+        refresh();
+    }
+
+    @Override
+    public void onAskSide() {
+        Tracker t = tracker;
+        if (t == null || overlay == null) return;
+        if (!t.canRead()) {
+            toast("Сначала откройте партию в начальной позиции: так я запомню, как выглядят фигуры. "
+                    + "Потом можно будет начинать с любой позиции");
+            return;
+        }
+        overlay.toggleChooser();
+    }
+
+    @Override
+    public void onSide(boolean whiteToMove) {
+        Tracker t = tracker;
+        if (t == null) return;
+        t.requestRead(whiteToMove);
+        kick();
     }
 
     @Override
@@ -433,6 +583,7 @@ public class CaptureService extends Service implements Tracker.Listener, Overlay
                 StringBuilder sb = new StringBuilder();
                 sb.append("status: ").append(tracker.status()).append('\n');
                 sb.append("geom: ").append(tracker.geom()).append('\n');
+                sb.append("from start: ").append(tracker.fromStart()).append('\n');
                 Position cur = tracker.current();
                 if (cur != null) sb.append("fen: ").append(cur.toFen()).append('\n');
                 sb.append("line: ").append(Pgn.movetext(tracker.sanLine())).append("\n\n");
@@ -499,6 +650,8 @@ public class CaptureService extends Service implements Tracker.Listener, Overlay
             final ImageReader r = reader;
             Handler h = new Handler(captureThread.getLooper());
             h.post(() -> {
+                h.removeCallbacks(processHeldTask);
+                closeHeld();
                 if (r != null) r.close();
             });
             captureThread.quitSafely();
@@ -506,6 +659,7 @@ public class CaptureService extends Service implements Tracker.Listener, Overlay
         display = null;
         reader = null;
         captureThread = null;
+        captureHandler = null;
         stopForeground(STOP_FOREGROUND_REMOVE);
         stopSelf();
     }

@@ -1,6 +1,10 @@
 package app.duochess.core;
 
+import java.io.DataInput;
+import java.io.DataOutput;
+import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 
 /**
@@ -46,25 +50,107 @@ public final class Calibration {
      */
     public static Calibration build(Frame f, BoardGeom g, boolean whiteBottom, Position pos, boolean[] skip) {
         Calibration c = new Calibration();
-        long[][] acc = new long[2][4];
+        c.measureBackground(f, g);
         for (int r = 0; r < 8; r++) {
             for (int col = 0; col < 8; col++) {
                 int img = r * 8 + col;
+                if (skip != null && skip[img]) continue;
+                int ring = Vision.ringColor(f, g, r, col);
+                int code = pos.b[Vision.chessSquare(r, col, whiteBottom)];
+                float[] d = Vision.descriptor(f, g, r, col, ring);
+                c.add(code, (r + col) & 1, d);
+            }
+        }
+        return c;
+    }
+
+    /** Background colour of the two kinds of squares, averaged over the board. */
+    private void measureBackground(Frame f, BoardGeom g) {
+        long[][] acc = new long[2][4];
+        for (int r = 0; r < 8; r++) {
+            for (int col = 0; col < 8; col++) {
                 int ring = Vision.ringColor(f, g, r, col);
                 int par = (r + col) & 1;
                 acc[par][0] += (ring >> 16) & 255;
                 acc[par][1] += (ring >> 8) & 255;
                 acc[par][2] += ring & 255;
                 acc[par][3]++;
-                if (skip != null && skip[img]) continue;
-                int code = pos.b[Vision.chessSquare(r, col, whiteBottom)];
-                float[] d = Vision.descriptor(f, g, r, col, ring);
-                c.add(code, par, d);
             }
         }
         for (int p = 0; p < 2; p++) {
             long n = Math.max(1, acc[p][3]);
-            c.parityColor[p] = (int) ((acc[p][0] / n) << 16 | (acc[p][1] / n) << 8 | (acc[p][2] / n));
+            parityColor[p] = (int) ((acc[p][0] / n) << 16 | (acc[p][1] / n) << 8 | (acc[p][2] / n));
+        }
+    }
+
+    /** Copy of what is known now; later learning does not change it. */
+    public Calibration snapshot() {
+        Calibration c = new Calibration();
+        c.templates.addAll(templates);
+        c.parityColor[0] = parityColor[0];
+        c.parityColor[1] = parityColor[1];
+        return c;
+    }
+
+    /** The same piece looks, with the square colours of the board now at g in f. */
+    public Calibration forFrame(Frame f, BoardGeom g) {
+        Calibration c = snapshot();
+        c.measureBackground(f, g);
+        return c;
+    }
+
+    /** True if pieces of this kind (signed code, 0 = empty) have been seen. */
+    public boolean knows(int code) {
+        if (code == 0) return true;
+        for (Template t : templates) if (t.code == code) return true;
+        return false;
+    }
+
+    /**
+     * Distance from d to the closest look of every kind of piece: index code + 6
+     * (0..12, 6 = empty). Float.MAX_VALUE for pieces never seen.
+     */
+    public float[] distances(float[] d) {
+        float[] out = new float[13];
+        Arrays.fill(out, Float.MAX_VALUE);
+        out[6] = Vision.mav(d);
+        for (Template t : templates) {
+            float x = Vision.dist(d, t.d);
+            int k = t.code + 6;
+            if (x < out[k]) out[k] = x;
+        }
+        return out;
+    }
+
+    private static final int MAGIC = 0x44434331;
+
+    public void write(DataOutput out) throws IOException {
+        out.writeInt(MAGIC);
+        out.writeInt(Vision.DESC);
+        out.writeInt(parityColor[0]);
+        out.writeInt(parityColor[1]);
+        out.writeInt(templates.size());
+        for (Template t : templates) {
+            out.writeInt(t.code);
+            out.writeInt(t.parity);
+            for (float v : t.d) out.writeFloat(v);
+        }
+    }
+
+    public static Calibration read(DataInput in) throws IOException {
+        if (in.readInt() != MAGIC || in.readInt() != Vision.DESC) throw new IOException("unknown format");
+        Calibration c = new Calibration();
+        c.parityColor[0] = in.readInt();
+        c.parityColor[1] = in.readInt();
+        int n = in.readInt();
+        if (n < 1 || n > 1000) throw new IOException("bad template count " + n);
+        for (int i = 0; i < n; i++) {
+            int code = in.readInt();
+            int parity = in.readInt();
+            if (code < -6 || code > 6 || (parity & ~1) != 0) throw new IOException("bad template");
+            float[] d = new float[Vision.DESC];
+            for (int k = 0; k < d.length; k++) d[k] = in.readFloat();
+            c.templates.add(new Template(code, parity, d));
         }
         return c;
     }
