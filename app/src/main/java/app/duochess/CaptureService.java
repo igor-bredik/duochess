@@ -102,6 +102,12 @@ public class CaptureService extends Service implements Tracker.Listener, Overlay
     private long startedAt;
 
     @Override
+    public void onCreate() {
+        super.onCreate();
+        CrashLog.install(this);
+    }
+
+    @Override
     public IBinder onBind(Intent intent) {
         return null;
     }
@@ -204,6 +210,7 @@ public class CaptureService extends Service implements Tracker.Listener, Overlay
         display = projection.createVirtualDisplay("duochess", w, h, dpi,
                 DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, reader.getSurface(), null, ch);
         running = true;
+        CrashLog.startWatchdog(this);
         startedAt = SystemClock.uptimeMillis();
     }
 
@@ -349,19 +356,31 @@ public class CaptureService extends Service implements Tracker.Listener, Overlay
 
     // ------------------------------------------------------------------ overlay text
 
-    private synchronized void refresh() {
+    /**
+     * Called from the capture, engine and main threads. It must not wait for the tracker (a frame
+     * may take long to process), so it reads the tracker's published state.
+     */
+    private void refresh() {
+        try {
+            refreshLocked();
+        } catch (Throwable e) {
+            Log.e(TAG, "refresh failed", e);
+        }
+    }
+
+    private synchronized void refreshLocked() {
         lastRefresh = SystemClock.uptimeMillis();
         Tracker t = tracker;
         Analyzer a = analyzer;
         OverlayPanel o = overlay;
         BoardOverlay bo = board;
         if (t == null || a == null || o == null || bo == null) return;
-        if (!t.active()) {
+        Tracker.State st = t.state();
+        if (!st.active) {
             bo.clear();
-            boolean canRead = t.canRead();
-            o.setChooserAuto(canRead);
+            o.setChooserAuto(st.canRead);
             o.setText(t.status().isEmpty() ? "Ищу доску…" : t.status(), "",
-                    canRead ? "Откройте партию в начальной позиции или начните с той, что сейчас на доске:"
+                    st.canRead ? "Откройте партию в начальной позиции или начните с той, что сейчас на доске:"
                             : "Откройте партию в начальной позиции. Это нужно один раз, чтобы запомнить фигуры: "
                             + "потом можно будет начинать с любой позиции",
                     OverlayPanel.NEUTRAL);
@@ -369,36 +388,30 @@ public class CaptureService extends Service implements Tracker.Listener, Overlay
             return;
         }
         o.setChooserAuto(false);
-        Position cur, prev = null, after = null;
+        Position prev = null, after = null;
         Move next = null, last = null;
-        BoardGeom g;
-        boolean wb, numbered;
         boolean arrows = arrowsOn;
+        int ply = st.ply;
+        int n = st.moves.size();
+        Position cur = st.positions.get(ply);
+        if (ply > 0) {
+            prev = st.positions.get(ply - 1);
+            last = st.moves.get(ply - 1);
+        }
+        if (ply < n) {
+            next = st.moves.get(ply);
+            after = st.positions.get(ply + 1);
+        }
+        BoardGeom g = st.geom;
+        boolean wb = st.whiteBottom, numbered = st.fromStart;
+        // Current position first, then its neighbours, then the rest of the known game.
         List<Position> want = new ArrayList<>();
-        synchronized (t) {
-            int ply = t.ply();
-            int n = t.lineLength();
-            cur = t.current();
-            if (cur == null) return;
-            if (ply > 0) {
-                prev = t.position(ply - 1);
-                last = t.move(ply - 1);
-            }
-            if (ply < n) {
-                next = t.move(ply);
-                after = t.position(ply + 1);
-            }
-            g = t.geom();
-            wb = t.playerWhite();
-            numbered = t.fromStart();
-            // Current position first, then its neighbours, then the rest of the known game.
-            want.add(cur);
-            if (after != null) want.add(after);
-            if (prev != null) want.add(prev);
-            for (int k = 1; k <= n; k++) {
-                if (ply + 1 + k <= n) want.add(t.position(ply + 1 + k));
-                if (ply - 1 - k >= 0) want.add(t.position(ply - 1 - k));
-            }
+        want.add(cur);
+        if (after != null) want.add(after);
+        if (prev != null) want.add(prev);
+        for (int k = 1; k <= n; k++) {
+            if (ply + 1 + k <= n) want.add(st.positions.get(ply + 1 + k));
+            if (ply - 1 - k >= 0) want.add(st.positions.get(ply - 1 - k));
         }
         a.request(want);
         a.start();
@@ -409,7 +422,7 @@ public class CaptureService extends Service implements Tracker.Listener, Overlay
         o.setText(v.l1, v.l2, v.l3, colorOf(v.verdict));
         o.setShort("♞ " + (eCur != null ? Advice.tinyEval(eCur) : "…"), colorOf(v.verdict));
 
-        if (!overlayChecked || overlaysCaptured || !contentVisible || !t.boardVisible() || g == null) {
+        if (!overlayChecked || overlaysCaptured || !contentVisible || !st.boardVisible || g == null) {
             bo.clear();
             return;
         }
@@ -499,18 +512,17 @@ public class CaptureService extends Service implements Tracker.Listener, Overlay
     @Override
     public void onLichess() {
         Tracker t = tracker;
-        if (t == null || !t.active()) {
+        Tracker.State st = t != null ? t.state() : null;
+        if (st == null || !st.active) {
             toast("Партия ещё не найдена");
             return;
         }
         String url;
-        synchronized (t) {
-            List<String> san = t.sanLine();
-            if (!t.fromStart() || san.contains("--")) {
-                url = "https://lichess.org/analysis/standard/" + t.current().toFen().replace(' ', '_');
-            } else {
-                url = Pgn.lichessUrl(san, t.playerWhite()) + "#" + t.ply();
-            }
+        List<String> san = st.sanLine();
+        if (!st.fromStart || san.contains("--")) {
+            url = "https://lichess.org/analysis/standard/" + st.current().toFen().replace(' ', '_');
+        } else {
+            url = Pgn.lichessUrl(san, st.whiteBottom) + "#" + st.ply;
         }
         Intent i = new Intent(Intent.ACTION_VIEW, Uri.parse(url));
         i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
@@ -539,7 +551,7 @@ public class CaptureService extends Service implements Tracker.Listener, Overlay
     public void onAskSide() {
         Tracker t = tracker;
         if (t == null || overlay == null) return;
-        if (!t.canRead()) {
+        if (!t.state().canRead) {
             toast("Сначала откройте партию в начальной позиции: так я запомню, как выглядят фигуры. "
                     + "Потом можно будет начинать с любой позиции");
             return;
@@ -582,11 +594,12 @@ public class CaptureService extends Service implements Tracker.Listener, Overlay
             if (tu != null) {
                 StringBuilder sb = new StringBuilder();
                 sb.append("status: ").append(tracker.status()).append('\n');
-                sb.append("geom: ").append(tracker.geom()).append('\n');
-                sb.append("from start: ").append(tracker.fromStart()).append('\n');
-                Position cur = tracker.current();
+                Tracker.State st = tracker.state();
+                sb.append("geom: ").append(st.geom).append('\n');
+                sb.append("from start: ").append(st.fromStart).append('\n');
+                Position cur = st.current();
                 if (cur != null) sb.append("fen: ").append(cur.toFen()).append('\n');
-                sb.append("line: ").append(Pgn.movetext(tracker.sanLine())).append("\n\n");
+                sb.append("line: ").append(Pgn.movetext(st.sanLine())).append("\n\n");
                 synchronized (tracker) {
                     sb.append(tracker.log);
                 }
@@ -637,6 +650,7 @@ public class CaptureService extends Service implements Tracker.Listener, Overlay
 
     private void shutdown() {
         running = false;
+        CrashLog.stopWatchdog();
         if (analyzer != null) analyzer.stop();
         if (overlay != null) overlay.hide();
         if (board != null) board.hide();
@@ -666,6 +680,7 @@ public class CaptureService extends Service implements Tracker.Listener, Overlay
 
     @Override
     public void onDestroy() {
+        CrashLog.stopWatchdog();
         if (projection != null || overlay != null) {
             running = false;
             if (analyzer != null) analyzer.stop();

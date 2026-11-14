@@ -2,6 +2,8 @@ package app.duochess;
 
 import android.Manifest;
 import android.app.Activity;
+import android.content.ClipData;
+import android.content.ClipboardManager;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.graphics.Color;
@@ -14,6 +16,7 @@ import android.os.Bundle;
 import android.provider.Settings;
 import android.util.TypedValue;
 import android.view.Gravity;
+import android.view.View;
 import android.widget.Button;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
@@ -28,10 +31,13 @@ public class MainActivity extends Activity {
     private TextView overlayState;
     private Button overlayButton;
     private Button startButton;
+    private TextView crashText;
+    private Button crashButton;
 
     @Override
     protected void onCreate(Bundle state) {
         super.onCreate(state);
+        CrashLog.install(this);
         int pad = dp(20);
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
@@ -41,6 +47,22 @@ public class MainActivity extends Activity {
         root.addView(text("DuoChess", 28, true, Color.WHITE));
         root.addView(text("Оценка ходов Stockfish поверх Duolingo Chess: в разборе партии и во время игры.",
                 15, false, Color.rgb(176, 190, 197)));
+
+        crashText = text("", 12, false, Color.rgb(255, 171, 145));
+        crashText.setTextIsSelectable(true);
+        crashText.setMaxLines(12);
+        root.addView(crashText);
+        crashButton = button("Скопировать отчёт о сбое и убрать");
+        crashButton.setOnClickListener(v -> {
+            String report = CrashLog.read(this);
+            if (report != null) {
+                getSystemService(ClipboardManager.class).setPrimaryClip(ClipData.newPlainText("DuoChess", report));
+                Toast.makeText(this, "Отчёт скопирован", Toast.LENGTH_SHORT).show();
+            }
+            CrashLog.clear(this);
+            showCrash();
+        });
+        root.addView(crashButton);
 
         root.addView(text("1. Разрешение", 18, true, Color.WHITE));
         overlayState = text("", 15, false, Color.rgb(176, 190, 197));
@@ -95,6 +117,15 @@ public class MainActivity extends Activity {
         overlayButton.setEnabled(!ok);
         overlayButton.setAlpha(ok ? 0.4f : 1f);
         startButton.setText(CaptureService.running ? "Остановить" : "Запустить");
+        showCrash();
+    }
+
+    private void showCrash() {
+        String report = CrashLog.read(this);
+        boolean has = report != null && !report.isEmpty();
+        crashText.setText(has ? "В прошлый раз приложение дало сбой. Отчёт:\n" + report : "");
+        crashText.setVisibility(has ? View.VISIBLE : View.GONE);
+        crashButton.setVisibility(has ? View.VISIBLE : View.GONE);
     }
 
     private void toggle() {
