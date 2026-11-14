@@ -2,6 +2,7 @@ package app.duochess.core;
 
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
 
@@ -42,7 +43,7 @@ public final class Tracker {
     private int lastJump = -1;
     private int invisible;
     private int frameNo;
-    private String status = "";
+    private volatile String status = "";
     /** Piece looks from the last starting position seen (this session or an earlier one). */
     private Calibration saved;
     /** Where boards were seen (most recent first): screens differ between the game and the review. */
@@ -59,65 +60,81 @@ public final class Tracker {
 
     // ------------------------------------------------------------------ state for the UI
 
-    public synchronized boolean active() {
-        return active;
+    /**
+     * What the tracker knows, as of the last processed frame. Immutable, so other threads read it
+     * without waiting for the frame being processed.
+     */
+    public static final class State {
+        public final boolean active;
+        /** Index of the shown position in positions. */
+        public final int ply;
+        /** Positions of the known line; moves.get(i) leads from positions.get(i) to the next one. */
+        public final List<Position> positions;
+        public final List<Move> moves;
+        public final BoardGeom geom;
+        /** True if the board was visible in the latest frame. */
+        public final boolean boardVisible;
+        public final boolean whiteBottom;
+        /** True if the game was followed from the starting position. */
+        public final boolean fromStart;
+        /** True if the position can be read from the board (piece looks are known). */
+        public final boolean canRead;
+
+        State(boolean active, int ply, List<Position> positions, List<Move> moves, BoardGeom geom,
+              boolean boardVisible, boolean whiteBottom, boolean fromStart, boolean canRead) {
+            this.active = active;
+            this.ply = ply;
+            this.positions = positions;
+            this.moves = moves;
+            this.geom = geom;
+            this.boardVisible = boardVisible;
+            this.whiteBottom = whiteBottom;
+            this.fromStart = fromStart;
+            this.canRead = canRead;
+        }
+
+        public Position current() {
+            return active ? positions.get(ply) : null;
+        }
+
+        public List<String> sanLine() {
+            List<String> out = new ArrayList<>();
+            for (int i = 0; i < moves.size(); i++) out.add(positions.get(i).san(moves.get(i)));
+            return out;
+        }
     }
 
-    public synchronized int ply() {
-        return cur;
+    private volatile State state = new State(false, 0, Collections.<Position>emptyList(),
+            Collections.<Move>emptyList(), null, false, true, true, false);
+    /** The line changed since the last published state. */
+    private boolean lineDirty;
+    /** Listener calls collected while the lock is held, made after it is released. */
+    private final List<Runnable> events = new ArrayList<>();
+
+    public State state() {
+        return state;
     }
 
-    public synchronized Position position(int i) {
-        return positions.get(i);
+    private void publish() {
+        State old = state;
+        List<Position> ps = old.positions;
+        List<Move> ms = old.moves;
+        if (lineDirty) {
+            ps = Collections.unmodifiableList(new ArrayList<>(positions));
+            ms = Collections.unmodifiableList(new ArrayList<>(moves));
+            lineDirty = false;
+        }
+        state = new State(active, cur, ps, ms, geom, geom != null && invisible == 0, whiteBottom, fromStart,
+                saved != null);
     }
 
-    public synchronized Position current() {
-        return active ? positions.get(cur) : null;
-    }
-
-    /** Number of moves known in the current line (may run past the shown position). */
-    public synchronized int lineLength() {
-        return active ? moves.size() : 0;
-    }
-
-    public synchronized Move move(int i) {
-        return moves.get(i);
-    }
-
-    /** True if the board was visible in the latest frame. */
-    public synchronized boolean boardVisible() {
-        return geom != null && invisible == 0;
-    }
-
-    /** Move that led to the current position, or null at the start. */
-    public synchronized Move lastMove() {
-        return active && cur > 0 ? moves.get(cur - 1) : null;
-    }
-
-    public synchronized List<String> sanLine() {
-        List<String> out = new ArrayList<>();
-        for (int i = 0; i < moves.size(); i++) out.add(positions.get(i).san(moves.get(i)));
-        return out;
-    }
-
-    public synchronized boolean playerWhite() {
-        return whiteBottom;
-    }
-
-    /** True if the position can be read from the board (piece looks are known). */
-    public synchronized boolean canRead() {
-        return saved != null;
-    }
-
-    public synchronized void setSaved(Calibration c, List<BoardGeom> knownBoards) {
-        saved = c;
-        boards.clear();
-        if (knownBoards != null) boards.addAll(knownBoards);
-    }
-
-    /** True if the game was followed from the starting position. */
-    public synchronized boolean fromStart() {
-        return fromStart;
+    public void setSaved(Calibration c, List<BoardGeom> knownBoards) {
+        synchronized (this) {
+            saved = c;
+            boards.clear();
+            if (knownBoards != null) boards.addAll(knownBoards);
+            publish();
+        }
     }
 
     /** Asks to take the position now on the board as the start, with the given side to move. */
@@ -133,15 +150,15 @@ public final class Tracker {
         return status;
     }
 
-    public synchronized BoardGeom geom() {
-        return geom;
-    }
-
-    private void setStatus(String s) {
+    private void setStatus(final String s) {
         if (!s.equals(status)) {
             status = s;
-            listener.onStatus(s);
+            events.add(() -> listener.onStatus(s));
         }
+    }
+
+    private void notice(final String text) {
+        events.add(() -> listener.onNotice(text));
     }
 
     private void logLine(String s) {
@@ -151,11 +168,20 @@ public final class Tracker {
 
     // ------------------------------------------------------------------ frame processing
 
+    /**
+     * The listener is called only after the lock is released: it may take its own locks, and
+     * those are also held by threads that wait for this tracker.
+     */
     public void process(Frame f, long now) {
         boolean changed;
+        List<Runnable> fire;
         synchronized (this) {
             changed = step(f, now);
+            publish();
+            fire = new ArrayList<>(events);
+            events.clear();
         }
+        for (Runnable r : fire) r.run();
         if (changed) listener.onPosition(this);
     }
 
@@ -230,6 +256,7 @@ public final class Tracker {
         positions.clear();
         moves.clear();
         positions.add(Position.initial());
+        lineDirty = true;
         cur = 0;
         active = true;
         lastDeepSig = null;
@@ -240,7 +267,13 @@ public final class Tracker {
     private void remember() {
         saved = cal.snapshot();
         rememberBoard(geom);
-        listener.onCalibrated(saved, new ArrayList<>(boards));
+        calibrated();
+    }
+
+    private void calibrated() {
+        final Calibration c = saved;
+        final List<BoardGeom> b = new ArrayList<>(boards);
+        events.add(() -> listener.onCalibrated(c, b));
     }
 
     /** Returns true if g is a new place. */
@@ -261,7 +294,7 @@ public final class Tracker {
     /** Takes the position now on the board as the start of the game. */
     private boolean readBoard(Frame f, boolean whiteToMove) {
         if (saved == null) {
-            listener.onNotice("Сначала откройте партию в начальной позиции: так я запомню, как выглядят фигуры");
+            notice("Сначала откройте партию в начальной позиции: так я запомню, как выглядят фигуры");
             return false;
         }
         BoardGeom g = Vision.findBoard(f);
@@ -279,14 +312,14 @@ public final class Tracker {
         }
         if (g == null) {
             logLine("read: no board");
-            listener.onNotice("Не вижу доску на экране");
+            notice("Не вижу доску на экране");
             return false;
         }
         Calibration c = saved.forFrame(f, g);
         BoardReader.Result r = BoardReader.read(f, g, c, whiteToMove, geom != null ? whiteBottom : true);
         if (r.pos == null) {
             logLine("read failed at " + g + ": " + r.error);
-            listener.onNotice(r.error);
+            notice(r.error);
             return false;
         }
         geom = g;
@@ -295,6 +328,7 @@ public final class Tracker {
         positions.clear();
         moves.clear();
         positions.add(r.pos);
+        lineDirty = true;
         cur = 0;
         active = true;
         fromStart = false;
@@ -304,8 +338,8 @@ public final class Tracker {
         stable = 0;
         invisible = 0;
         logLine("read position at " + g + ": " + r.pos.toFen() + (whiteBottom ? ", white" : ", black") + " at bottom");
-        if (rememberBoard(g)) listener.onCalibrated(saved, new ArrayList<>(boards));
-        if (r.note != null) listener.onNotice(r.note);
+        if (rememberBoard(g)) calibrated();
+        if (r.note != null) notice(r.note);
         setStatus(statusText());
         return true;
     }
@@ -454,6 +488,7 @@ public final class Tracker {
             }
         }
         if (!replay) {
+            lineDirty = true;
             while (moves.size() > cur) moves.remove(moves.size() - 1);
             while (positions.size() > cur + 1) positions.remove(positions.size() - 1);
             Position p = positions.get(cur);
@@ -488,6 +523,8 @@ public final class Tracker {
         active = false;
         positions.clear();
         moves.clear();
+        lineDirty = true;
         cur = 0;
+        publish();
     }
 }
